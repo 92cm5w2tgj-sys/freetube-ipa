@@ -13,7 +13,7 @@ concurrency:
   cancel-in-progress: false
 
 env:
-  PATCH_REVISION: ios27fix1
+  PATCH_REVISION: ios27fix2
 
 jobs:
   check:
@@ -106,8 +106,14 @@ jobs:
           fi
 
           echo "Patching: $PATCH_FILE"
-          export PATCH_FILE
 
+          # SwiftPM checkouts can be read-only on GitHub's macOS runner.
+          # Remove an immutable flag if present and make the checkout writable before patching.
+          chflags nouchg "$PATCH_FILE" 2>/dev/null || true
+          chmod u+w "$PATCH_FILE"
+          ls -l "$PATCH_FILE"
+
+          export PATCH_FILE
           python3 <<'PY'
           import os
           import re
