@@ -2,6 +2,11 @@ name: Auto build & release tankxu FreeTube IPA
 
 on:
   workflow_dispatch:
+  push:
+    branches:
+      - main
+    paths:
+      - '.github/workflows/freetube-tankxu-autorelease.yml'
   schedule:
     - cron: "17 */6 * * *"
 
@@ -13,7 +18,7 @@ concurrency:
   cancel-in-progress: false
 
 env:
-  PATCH_REVISION: ios27fix2
+  PATCH_REVISION: ios27fix3
 
 jobs:
   check:
@@ -92,7 +97,7 @@ jobs:
             -derivedDataPath "$GITHUB_WORKSPACE/DerivedData" \
             | tee "$GITHUB_WORKSPACE/package-resolution.log"
 
-      - name: Apply iOS 27 LNPopupController NaN guard
+      - name: Apply iOS 27 LNPopupController geometry guards
         run: |
           set -euo pipefail
 
@@ -106,14 +111,10 @@ jobs:
           fi
 
           echo "Patching: $PATCH_FILE"
-
-          # SwiftPM checkouts can be read-only on GitHub's macOS runner.
-          # Remove an immutable flag if present and make the checkout writable before patching.
           chflags nouchg "$PATCH_FILE" 2>/dev/null || true
           chmod u+w "$PATCH_FILE"
-          ls -l "$PATCH_FILE"
-
           export PATCH_FILE
+
           python3 <<'PY'
           import os
           import re
@@ -122,7 +123,8 @@ jobs:
           path = Path(os.environ["PATCH_FILE"])
           text = path.read_text(encoding="utf-8")
 
-          pattern = re.compile(
+          # Guard the percentage calculation against divide-by-zero / NaN.
+          percent_pattern = re.compile(
               r'- \(CGFloat\)_percentFromPopupBar\s*'
               r'\{\s*'
               r'return 1 - \(CGRectGetMaxY\(self\.popupBar\.frame\) / '
@@ -131,7 +133,7 @@ jobs:
               re.MULTILINE,
           )
 
-          replacement = '''- (CGFloat)_percentFromPopupBar
+          percent_replacement = '''- (CGFloat)_percentFromPopupBar
           {
           \tCGFloat denominator = _cachedDefaultFrame.origin.y - _cachedInsets.bottom;
           \tif(!isfinite(denominator) || (denominator > -0.0001 && denominator < 0.0001))
@@ -149,14 +151,44 @@ jobs:
           \treturn isfinite(percent) ? percent : 0.0;
           }'''
 
-          patched, count = pattern.subn(replacement, text, count=1)
-          if count != 1:
-              raise SystemExit("Could not locate the expected _percentFromPopupBar implementation; refusing to build an unpatched IPA")
+          text, count1 = percent_pattern.subn(percent_replacement, text, count=1)
+          if count1 != 1:
+              raise SystemExit("Could not patch _percentFromPopupBar")
 
-          path.write_text(patched, encoding="utf-8")
-          print("Applied iOS 27 NaN/divide-by-zero guard successfully")
+          # Final safety net: sanitize the content CGRect immediately before UIKit/CALayer sees it.
+          target = "\tself.popupContentView.frame = contentFrame;"
+          if target not in text:
+              raise SystemExit("Could not locate popupContentView.frame assignment")
+
+          geometry_guard = '''\tCGRect safeBounds = _containerController.view.bounds;
+          \tCGFloat safeWidth = (isfinite(safeBounds.size.width) && safeBounds.size.width >= 0.0) ? safeBounds.size.width : 0.0;
+          \tCGFloat safeHeight = (isfinite(safeBounds.size.height) && safeBounds.size.height >= 0.0) ? safeBounds.size.height : 0.0;
+
+          \tif(!isfinite(contentFrame.origin.x))
+          \t{
+          \t\tcontentFrame.origin.x = 0.0;
+          \t}
+          \tif(!isfinite(contentFrame.origin.y))
+          \t{
+          \t\tcontentFrame.origin.y = self.popupControllerTargetState <= LNPopupPresentationStateBarPresented ? safeHeight : 0.0;
+          \t}
+          \tif(!isfinite(contentFrame.size.width) || contentFrame.size.width < 0.0)
+          \t{
+          \t\tcontentFrame.size.width = safeWidth;
+          \t}
+          \tif(!isfinite(contentFrame.size.height) || contentFrame.size.height < 0.0)
+          \t{
+          \t\tcontentFrame.size.height = self.popupControllerTargetState <= LNPopupPresentationStateBarPresented ? 0.0 : safeHeight;
+          \t}
+
+          \tself.popupContentView.frame = contentFrame;'''
+
+          text = text.replace(target, geometry_guard, 1)
+          path.write_text(text, encoding="utf-8")
+          print("Applied iOS 27 percent guard + final CGRect sanitization")
           PY
 
+          grep -n -A30 -- 'CGRect safeBounds' "$PATCH_FILE" | head -n 36
           grep -n -A18 -- '- (CGFloat)_percentFromPopupBar' "$PATCH_FILE" | head -n 24
 
       - name: Build unsigned Release app
@@ -233,7 +265,7 @@ jobs:
           - Configuration: Release / iphoneos
           - Minimum iOS: 17.0+
           - Patch: ${PATCH_REVISION}
-          - iOS 27 compatibility: guards LNPopupController popup geometry against NaN/divide-by-zero during presentation
+          - iOS 27 compatibility: guards LNPopupController percentage math and sanitizes the final popup content CGRect before CALayer receives it
 
           This IPA is unsigned. Sign it with your own signing method before installing on a normal iPhone/iPad.
           EOF
