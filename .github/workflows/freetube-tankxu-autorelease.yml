@@ -12,6 +12,9 @@ concurrency:
   group: freetube-tankxu-autorelease
   cancel-in-progress: false
 
+env:
+  PATCH_REVISION: ios27fix1
+
 jobs:
   check:
     runs-on: ubuntu-latest
@@ -37,7 +40,7 @@ jobs:
           fi
 
           SHORT_SHA="${SHA:0:8}"
-          TAG="freetube-tankxu-${SHORT_SHA}"
+          TAG="freetube-tankxu-${SHORT_SHA}-${PATCH_REVISION}"
 
           echo "sha=$SHA" >> "$GITHUB_OUTPUT"
           echo "short_sha=$SHORT_SHA" >> "$GITHUB_OUTPUT"
@@ -47,7 +50,7 @@ jobs:
             echo "Release $TAG already exists; skipping."
             echo "should_build=false" >> "$GITHUB_OUTPUT"
           else
-            echo "New upstream commit detected: $SHA"
+            echo "New patched build required for: $SHA"
             echo "should_build=true" >> "$GITHUB_OUTPUT"
           fi
 
@@ -81,17 +84,79 @@ jobs:
         working-directory: source
         run: |
           set -o pipefail
+          rm -rf "$GITHUB_WORKSPACE/DerivedData"
           xcodebuild \
             -resolvePackageDependencies \
             -project FreeTube/FreeTube.xcodeproj \
             -scheme FreeTube \
+            -derivedDataPath "$GITHUB_WORKSPACE/DerivedData" \
             | tee "$GITHUB_WORKSPACE/package-resolution.log"
+
+      - name: Apply iOS 27 LNPopupController NaN guard
+        run: |
+          set -euo pipefail
+
+          CHECKOUTS="$GITHUB_WORKSPACE/DerivedData/SourcePackages/checkouts"
+          PATCH_FILE="$(find "$CHECKOUTS" -type f -name 'LNPopupController.mm' | head -n 1)"
+
+          if [ -z "$PATCH_FILE" ] || [ ! -f "$PATCH_FILE" ]; then
+            echo "::error::LNPopupController.mm was not found"
+            find "$CHECKOUTS" -maxdepth 5 -type f -iname '*LNPopupController*' -print || true
+            exit 1
+          fi
+
+          echo "Patching: $PATCH_FILE"
+          export PATCH_FILE
+
+          python3 <<'PY'
+          import os
+          import re
+          from pathlib import Path
+
+          path = Path(os.environ["PATCH_FILE"])
+          text = path.read_text(encoding="utf-8")
+
+          pattern = re.compile(
+              r'- \(CGFloat\)_percentFromPopupBar\s*'
+              r'\{\s*'
+              r'return 1 - \(CGRectGetMaxY\(self\.popupBar\.frame\) / '
+              r'\(_cachedDefaultFrame\.origin\.y - _cachedInsets\.bottom\)\);\s*'
+              r'\}',
+              re.MULTILINE,
+          )
+
+          replacement = '''- (CGFloat)_percentFromPopupBar
+          {
+          \tCGFloat denominator = _cachedDefaultFrame.origin.y - _cachedInsets.bottom;
+          \tif(!isfinite(denominator) || (denominator > -0.0001 && denominator < 0.0001))
+          \t{
+          \t\treturn 0.0;
+          \t}
+
+          \tCGFloat maxY = CGRectGetMaxY(self.popupBar.frame);
+          \tif(!isfinite(maxY))
+          \t{
+          \t\treturn 0.0;
+          \t}
+
+          \tCGFloat percent = 1.0 - (maxY / denominator);
+          \treturn isfinite(percent) ? percent : 0.0;
+          }'''
+
+          patched, count = pattern.subn(replacement, text, count=1)
+          if count != 1:
+              raise SystemExit("Could not locate the expected _percentFromPopupBar implementation; refusing to build an unpatched IPA")
+
+          path.write_text(patched, encoding="utf-8")
+          print("Applied iOS 27 NaN/divide-by-zero guard successfully")
+          PY
+
+          grep -n -A18 -- '- (CGFloat)_percentFromPopupBar' "$PATCH_FILE" | head -n 24
 
       - name: Build unsigned Release app
         working-directory: source
         run: |
           set -o pipefail
-          rm -rf "$GITHUB_WORKSPACE/DerivedData"
 
           xcodebuild \
             -project FreeTube/FreeTube.xcodeproj \
@@ -100,6 +165,7 @@ jobs:
             -sdk iphoneos \
             -destination 'generic/platform=iOS' \
             -derivedDataPath "$GITHUB_WORKSPACE/DerivedData" \
+            -disableAutomaticPackageResolution \
             CODE_SIGNING_ALLOWED=NO \
             CODE_SIGNING_REQUIRED=NO \
             CODE_SIGN_IDENTITY="" \
@@ -126,7 +192,7 @@ jobs:
           ditto "$APP" "$GITHUB_WORKSPACE/Payload/FreeTube.app"
 
           cd "$GITHUB_WORKSPACE"
-          IPA="FreeTube-tankxu-${SHORT_SHA}-unsigned.ipa"
+          IPA="FreeTube-tankxu-${SHORT_SHA}-${PATCH_REVISION}-unsigned.ipa"
           /usr/bin/zip -qry "$IPA" Payload
           shasum -a 256 "$IPA" > "${IPA}.sha256"
           echo "IPA_NAME=$IPA" >> "$GITHUB_ENV"
@@ -136,7 +202,7 @@ jobs:
       - name: Upload Actions artifact
         uses: actions/upload-artifact@v4
         with:
-          name: FreeTube-tankxu-${{ needs.check.outputs.short_sha }}-unsigned-IPA
+          name: FreeTube-tankxu-${{ needs.check.outputs.short_sha }}-${{ env.PATCH_REVISION }}-unsigned-IPA
           path: |
             ${{ env.IPA_NAME }}
             ${{ env.IPA_NAME }}.sha256
@@ -158,9 +224,10 @@ jobs:
 
           - Branch: tankxu
           - Commit: ${SHA}
-          - Configuration: Release
-          - SDK: iphoneos
+          - Configuration: Release / iphoneos
           - Minimum iOS: 17.0+
+          - Patch: ${PATCH_REVISION}
+          - iOS 27 compatibility: guards LNPopupController popup geometry against NaN/divide-by-zero during presentation
 
           This IPA is unsigned. Sign it with your own signing method before installing on a normal iPhone/iPad.
           EOF
@@ -169,14 +236,14 @@ jobs:
             "$IPA_NAME" \
             "${IPA_NAME}.sha256" \
             --repo "$GITHUB_REPOSITORY" \
-            --title "FreeTube tankxu ${SHORT_SHA}" \
+            --title "FreeTube tankxu ${SHORT_SHA} ${PATCH_REVISION}" \
             --notes-file release-notes.md
 
       - name: Upload logs on failure
         if: failure()
         uses: actions/upload-artifact@v4
         with:
-          name: FreeTube-tankxu-${{ needs.check.outputs.short_sha }}-build-logs
+          name: FreeTube-tankxu-${{ needs.check.outputs.short_sha }}-${{ env.PATCH_REVISION }}-build-logs
           path: |
             xcodebuild.log
             package-resolution.log
