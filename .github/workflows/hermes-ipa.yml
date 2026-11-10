@@ -1,0 +1,41 @@
+name: HermesEnabler IPA (unsigned)
+
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - .github/workflows/hermes-ipa.yml
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: macos-26
+    steps:
+      - name: Checkout upstream pookjw/HermesEnabler
+        uses: actions/checkout@v4
+        with:
+          repository: pookjw/HermesEnabler
+          path: src
+
+      - name: Build unsigned IPA
+        id: b
+        run: |
+          cd src
+          SHA=$(git rev-parse --short HEAD)
+          echo "sha=$SHA" >> "$GITHUB_OUTPUT"
+          xcodebuild -version
+          bash scripts/create_ipa.sh --bundle-id com.hermes.enabler --output "$GITHUB_WORKSPACE/HermesEnabler-$SHA-unsigned.ipa"
+          ls -la "$GITHUB_WORKSPACE"/*.ipa
+
+      - name: Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          TAG="hermes-${{ steps.b.outputs.sha }}"
+          gh release delete "$TAG" -R "${{ github.repository }}" -y --cleanup-tag 2>/dev/null || true
+          gh release create "$TAG" "HermesEnabler-${{ steps.b.outputs.sha }}-unsigned.ipa" \
+            -R "${{ github.repository }}" \
+            --title "HermesEnabler ${{ steps.b.outputs.sha }} (unsigned)" \
+            --notes "Unsigned IPA (iPhone companion + embedded Watch app) built from pookjw/HermesEnabler commit ${{ steps.b.outputs.sha }}. Sign with iloader/SideStore/Impactor."
