@@ -25,6 +25,7 @@ jobs:
           cd src
           SHA=$(git rev-parse --short HEAD)
           echo "sha=$SHA" >> "$GITHUB_OUTPUT"
+          sed -i '' 's/objectVersion = 110;/objectVersion = 77;/' HermesEnabler2.xcodeproj/project.pbxproj
           xcodebuild -version
           bash scripts/create_ipa.sh --bundle-id com.hermes.enabler --output "$GITHUB_WORKSPACE/HermesEnabler-$SHA-unsigned.ipa"
           ls -la "$GITHUB_WORKSPACE"/*.ipa
